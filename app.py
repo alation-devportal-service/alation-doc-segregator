@@ -11,7 +11,7 @@ import pandas as pd
 
 # --- 1. SETUP & CONSTANTS ---
 st.set_page_config(page_title="Alation Docs Segregator & Exporter", layout="wide")
-st.title("Alation Docs Segregator (With Markdown Translation)")
+st.title("Alation Docs Segregator (With Migration Exporter)")
 
 REPO_URL = st.secrets.get("REPO_URL", "github.com/your-org/your-repo.git")
 
@@ -28,13 +28,15 @@ LABEL_ONPREM = ".. include:: /shared/ProductLabels/CustomerManaged_Label.rst"
 IGNORE_DIRS = {'_build', '.github', 'venv', 'env', '.git', '__pycache__', 'node_modules'}
 ESSENTIAL_BUILD_FILES = {'conf.py', 'makefile', 'make.bat', 'requirements.txt'}
 
-# --- REGEX COMPILES ---
+# --- REGEX COMPILES FOR DEPENDENCY TRACING ---
 RE_LABEL_DEF = re.compile(r'^\s*\.\.\s+_([^:]+):', re.MULTILINE)
 RE_INCLUDE = re.compile(r'^\s*\.\.\s+include::\s+(.+)$', re.MULTILINE)
 RE_IMAGE = re.compile(r'\.\.\s+(?:\|[^\|]+\|\s+)?(?:image|figure)::\s+([^\s]+)', re.MULTILINE)
 RE_DOC = re.compile(r':doc:`(?:[^<`]*<([^>]+)>|([^`]+))`')
 RE_REF = re.compile(r':ref:`(?:[^<`]*<([^>]+)>|([^`]+))`')
 RE_DOWNLOAD = re.compile(r':download:`(?:[^<`]*<([^>]+)>|([^`]+))`')
+RE_MERMAID = re.compile(r'\.\.\s+mermaid::\s+([^\s]+\.mmd)', re.MULTILINE)
+RE_VIDEO = re.compile(r'\.\.\s+video::\s+([^\s]+)', re.MULTILINE)
 
 # --- 2. PATH RESOLUTION HELPER ---
 def resolve_sphinx_path(current_file_rel, ref_path):
@@ -66,23 +68,24 @@ def analyze_dependencies(repo_dir):
     for root, dirs, files in os.walk(repo_dir):
         dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith('.')]
         for file in files:
-            if file.endswith('.rst'):
+            if file.endswith('.rst') or file.endswith('.mmd'):
                 file_path = os.path.relpath(os.path.join(root, file), repo_dir).replace("\\", "/")
                 all_files.add(file_path)
                 
-                with open(os.path.join(repo_dir, file_path), 'r', encoding='utf-8') as f:
-                    content = f.read()
+                if file.endswith('.rst'):
+                    with open(os.path.join(repo_dir, file_path), 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        
+                    tags = set()
+                    if LABEL_CLOUD in content: tags.add('Alation Cloud Service')
+                    if LABEL_ONPREM in content: tags.add('CustomerManaged')
+                    if LABEL_BOTH in content:
+                        tags.add('Alation Cloud Service')
+                        tags.add('CustomerManaged')
+                    file_tags[file_path] = tags
                     
-                tags = set()
-                if LABEL_CLOUD in content: tags.add('Alation Cloud Service')
-                if LABEL_ONPREM in content: tags.add('CustomerManaged')
-                if LABEL_BOTH in content:
-                    tags.add('Alation Cloud Service')
-                    tags.add('CustomerManaged')
-                file_tags[file_path] = tags
-                
-                for match in RE_LABEL_DEF.finditer(content):
-                    label_to_file[match.group(1).strip()] = file_path
+                    for match in RE_LABEL_DEF.finditer(content):
+                        label_to_file[match.group(1).strip()] = file_path
 
     for file_path in file_tags.keys():
         deps = set()
@@ -91,6 +94,8 @@ def analyze_dependencies(repo_dir):
             
         for match in RE_INCLUDE.finditer(content): deps.add(resolve_sphinx_path(file_path, match.group(1)))
         for match in RE_IMAGE.finditer(content): deps.add(resolve_sphinx_path(file_path, match.group(1)))
+        for match in RE_MERMAID.finditer(content): deps.add(resolve_sphinx_path(file_path, match.group(1)))
+        for match in RE_VIDEO.finditer(content): deps.add(resolve_sphinx_path(file_path, match.group(1)))
         for match in RE_DOWNLOAD.finditer(content):
             ref = match.group(1) if match.group(1) else match.group(2)
             deps.add(resolve_sphinx_path(file_path, ref))
@@ -125,18 +130,22 @@ def analyze_dependencies(repo_dir):
 
 # --- 5. PHASE 2: TRANSLATOR ENGINE ---
 def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir):
-    """Translates reST to Markdown with Fail-Safe Inlining."""
+    """Translates reST to Markdown handling all Alation Sphinx corner cases."""
     
-    # 1. Headers
+    # 1. Global Epilog Substitutions from conf.py
+    content = content.replace('|v|', '✅')
+    content = content.replace('|x|', '❌')
+
+    # 2. Headers
     content = re.sub(r'^([^\n]+)\n[=]{3,}$', r'# \1', content, flags=re.MULTILINE)
     content = re.sub(r'^([^\n]+)\n[-]{3,}$', r'## \1', content, flags=re.MULTILINE)
     content = re.sub(r'^([^\n]+)\n[~]{3,}$', r'### \1', content, flags=re.MULTILINE)
 
-    # 2. Links
+    # 3. Links (:doc:, :ref:)
     content = re.sub(r':doc:`(?:[^<`]*<([^>]+)>|([^`]+))`', lambda m: f"[{m.group(1) or m.group(2)}]({(m.group(1) or m.group(2)).replace('.rst', '')}.md)", content)
     content = re.sub(r':ref:`(?:[^<`]*<([^>]+)>|([^`]+))`', lambda m: f"[{m.group(1) or m.group(2)}](#{(m.group(1) or m.group(2)).lower().replace(' ', '-')})", content)
 
-    # 3. Code Blocks
+    # 4. Code Blocks
     def replace_code_block(match):
         lang = match.group(1)
         code = match.group(2)
@@ -144,13 +153,19 @@ def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir
         return f"```{lang}\n{unindented}\n```"
     content = re.sub(r'\.\.\s+code-block::\s*(\w*)\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', replace_code_block, content)
 
-    # 4. Includes with FAIL-SAFE logic
+    # 5. Raw HTML Directives (Preserve and Un-indent)
+    def handle_raw_html(match):
+        html_content = match.group(1)
+        unindented = re.sub(r'^[ \t]+', '', html_content, flags=re.MULTILINE)
+        return f"\n{unindented}\n"
+    content = re.sub(r'\.\.\s+raw::\s*html\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_raw_html, content)
+
+    # 6. Includes with FAIL-SAFE logic
     def handle_include(match):
         include_path = match.group(1).strip()
         resolved_original_path = resolve_sphinx_path(current_rel_path, include_path)
         abs_original_path = os.path.join(repo_dir, resolved_original_path)
         
-        # Determine if file successfully made it to the segregated environment
         staging_file_path = os.path.join(target_base_dir, resolved_original_path)
         
         # FAIL-SAFE OR FLAT MODE TRIGGER
@@ -174,7 +189,7 @@ def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir
             
     content = re.sub(r'^\s*\.\.\s+include::\s+(.+)$', handle_include, content, flags=re.MULTILINE)
 
-    # 5. Admonitions
+    # 7. Admonitions
     def handle_admonition(match):
         adm_type = match.group(1).title()
         text = match.group(2)
@@ -186,8 +201,54 @@ def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir
             return f"> **{adm_type}**\n> {unindented.replace(chr(10), chr(10) + '> ')}"
     content = re.sub(r'\.\.\s+(note|warning|tip|important|caution|info)::\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_admonition, content)
 
-    # 6. Basic formatting
+    # 8. Mermaid Diagrams
+    def handle_mermaid(match):
+        mmd_path = match.group(1).strip()
+        resolved_path = resolve_sphinx_path(current_rel_path, mmd_path)
+        abs_path = os.path.join(repo_dir, resolved_path)
+        try:
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                mmd_content = f.read().strip()
+            return f"```mermaid\n{mmd_content}\n```"
+        except Exception:
+            return f"> **Error:** Could not resolve Mermaid diagram: {mmd_path}"
+    content = re.sub(r'^\s*\.\.\s+mermaid::\s+([^\s]+\.mmd)', handle_mermaid, content, flags=re.MULTILINE)
+
+    # 9. Videos
+    def handle_video(match):
+        video_path = match.group(1).strip()
+        clean_path = video_path.lstrip('/')
+        return f'<video controls width="100%"><source src="{clean_path}" type="video/mp4"></video>'
+    content = re.sub(r'^\s*\.\.\s+video::\s+([^\s]+)', handle_video, content, flags=re.MULTILINE)
+
+    # 10. Collapse (sphinx_collapse to HTML details)
+    def handle_collapse(match):
+        summary = match.group(1).strip()
+        body = match.group(2)
+        unindented = re.sub(r'^[ \t]+', '', body, flags=re.MULTILINE).strip()
+        return f"<details>\n<summary>{summary}</summary>\n\n{unindented}\n</details>"
+    content = re.sub(r'\.\.\s+collapse::\s*(.*?)\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_collapse, content)
+
+    # 11. Tabs (sphinx_tabs fallback conversion)
+    # Strip the .. tabs:: container
+    content = re.sub(r'^\s*\.\.\s+tabs::\s*\n', '', content, flags=re.MULTILINE)
+    # Convert individual tabs to headers or gitbook format based on mode
+    def handle_tab(match):
+        title = match.group(1).strip()
+        body = match.group(2)
+        unindented = re.sub(r'^[ \t]+', '', body, flags=re.MULTILINE).strip()
+        if mode == 'mintlify':
+            # Simplified output, manual closure review required for complex nesting
+            return f"### {title}\n\n{unindented}\n" 
+        elif mode == 'gitbook':
+            return f"{{% tab title=\"{title}\" %}}\n{unindented}\n{{% endtab %}}"
+        else:
+            return f"### {title}\n\n{unindented}\n"
+    content = re.sub(r'\.\.\s+tab::\s*(.*?)\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_tab, content)
+
+    # 12. Basic formatting inline (`` -> `)
     content = re.sub(r'``([^`]+)``', r'`\1`', content)
+    
     return content
 
 # --- 6. PHASE 3: FILE GENERATION & ZIP ---
@@ -198,7 +259,6 @@ def generate_segregated_environment(repo_dir, cloud_required, onprem_required, o
     
     stats = {"cloud": 0, "onprem": 0}
 
-    # Helper to physically copy files
     def safe_copy(src_rel_path, target_base_dir):
         src_abs = os.path.join(repo_dir, src_rel_path)
         if os.path.exists(src_abs):
@@ -246,7 +306,7 @@ def generate_segregated_environment(repo_dir, cloud_required, onprem_required, o
                         with open(new_file_path, 'w', encoding='utf-8') as f:
                             f.write(translated_content)
                             
-                        os.remove(file_path) # Delete old .rst file
+                        os.remove(file_path) # Clean up old .rst
 
     # 3. Zip and Cleanup
     zip_base_path = os.path.join(tempfile.gettempdir(), "Alation_Final_Docs")
@@ -348,7 +408,6 @@ def main():
                     propagate_tags(manual_cloud_starts, final_cloud, deps)
                     propagate_tags(manual_onprem_starts, final_onprem, deps)
                     
-                    # Map UI selection to code variable
                     mode_map = {"Sphinx reST (Original)": "rest", "Mintlify (MDX)": "mintlify", "GitBook (MD)": "gitbook", "Flat Markdown (MD)": "flat"}
                     selected_mode = mode_map[output_format]
 
