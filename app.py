@@ -37,6 +37,8 @@ RE_REF = re.compile(r':ref:`(?:[^<`]*<([^>]+)>|([^`]+))`')
 RE_DOWNLOAD = re.compile(r':download:`(?:[^<`]*<([^>]+)>|([^`]+))`')
 RE_MERMAID = re.compile(r'\.\.\s+mermaid::\s+([^\s]+\.mmd)', re.MULTILINE)
 RE_VIDEO = re.compile(r'\.\.\s+video::\s+([^\s]+)', re.MULTILINE)
+# Grid table detector: matches +---+---+ or +===+===+
+RE_GRID_TABLE = re.compile(r'^\+[-=]+\+[-=]+\+', re.MULTILINE) 
 
 # --- 2. PATH RESOLUTION HELPER ---
 def resolve_sphinx_path(current_file_rel, ref_path):
@@ -64,11 +66,12 @@ def analyze_dependencies(repo_dir):
     label_to_file = {}       
     file_dependencies = {}   
     all_files = set()
+    grid_table_files = set()
     
     for root, dirs, files in os.walk(repo_dir):
         dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith('.')]
         for file in files:
-            if file.endswith('.rst') or file.endswith('.mmd'):
+            if file.endswith('.rst') or file.endswith('.mmd') or file.endswith('.mp4'):
                 file_path = os.path.relpath(os.path.join(root, file), repo_dir).replace("\\", "/")
                 all_files.add(file_path)
                 
@@ -83,6 +86,9 @@ def analyze_dependencies(repo_dir):
                         tags.add('Alation Cloud Service')
                         tags.add('CustomerManaged')
                     file_tags[file_path] = tags
+                    
+                    if RE_GRID_TABLE.search(content):
+                        grid_table_files.add(file_path)
                     
                     for match in RE_LABEL_DEF.finditer(content):
                         label_to_file[match.group(1).strip()] = file_path
@@ -126,127 +132,98 @@ def analyze_dependencies(repo_dir):
         if f.lower() not in ESSENTIAL_BUILD_FILES and f not in cloud_required and f not in onprem_required:
             untagged.append(f)
             
-    return cloud_required, onprem_required, untagged, file_dependencies
+    return cloud_required, onprem_required, untagged, file_dependencies, grid_table_files
 
 # --- 5. PHASE 2: TRANSLATOR ENGINE ---
 def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir):
-    """Translates reST to Markdown handling all Alation Sphinx corner cases."""
+    """Translates reST to Markdown handling Alation Sphinx corner cases."""
     
-    # 1. Global Epilog Substitutions from conf.py
+    # 1. Global Epilog Substitutions
     content = content.replace('|v|', '✅')
     content = content.replace('|x|', '❌')
 
-    # 2. Headers
+    # 2. Strip LaTeX-only directives, table formatting, and classes
+    content = re.sub(r'^\s*\.\.\s+tabularcolumns::.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'\.\.\s+only::\s*latex\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', '', content)
+    content = re.sub(r'^\s*\.\.\s+rst-class::.*$', '', content, flags=re.MULTILINE)
+
+    # 3. Unwrap HTML-only blocks and Containers
+    def unwrap_block(match):
+        return "\n" + re.sub(r'^[ \t]+', '', match.group(1), flags=re.MULTILINE) + "\n"
+    content = re.sub(r'\.\.\s+(?:only::\s*html|container::)\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', unwrap_block, content)
+
+    # 4. Meta to YAML Frontmatter
+    def handle_meta(match):
+        yaml_lines = ["---"]
+        for line in match.group(1).split('\n'):
+            line = line.strip()
+            if line.startswith(':'):
+                parts = line.split(':', 2)
+                if len(parts) >= 3:
+                    key, val = parts[1].strip(), parts[2].strip()
+                    yaml_lines.append(f'{key}: "{val}"' if ':' in val else f"{key}: {val}")
+        yaml_lines.append("---")
+        return "\n".join(yaml_lines) + "\n\n"
+    content = re.sub(r'^\s*\.\.\s+meta::\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_meta, content, flags=re.MULTILINE)
+
+    # 5. Headers (including ^^^ level 4 headers)
     content = re.sub(r'^([^\n]+)\n[=]{3,}$', r'# \1', content, flags=re.MULTILINE)
     content = re.sub(r'^([^\n]+)\n[-]{3,}$', r'## \1', content, flags=re.MULTILINE)
     content = re.sub(r'^([^\n]+)\n[~]{3,}$', r'### \1', content, flags=re.MULTILINE)
+    content = re.sub(r'^([^\n]+)\n[\^]{3,}$', r'#### \1', content, flags=re.MULTILINE)
 
-    # 3. Links (:doc:, :ref:)
+    # 6. Links (:doc:, :ref:)
     content = re.sub(r':doc:`(?:[^<`]*<([^>]+)>|([^`]+))`', lambda m: f"[{m.group(1) or m.group(2)}]({(m.group(1) or m.group(2)).replace('.rst', '')}.md)", content)
     content = re.sub(r':ref:`(?:[^<`]*<([^>]+)>|([^`]+))`', lambda m: f"[{m.group(1) or m.group(2)}](#{(m.group(1) or m.group(2)).lower().replace(' ', '-')})", content)
 
-    # 4. Code Blocks
+    # 7. Code Blocks
     def replace_code_block(match):
-        lang = match.group(1)
-        code = match.group(2)
-        unindented = re.sub(r'^[ \t]+', '', code, flags=re.MULTILINE)
-        return f"```{lang}\n{unindented}\n```"
+        lang, code = match.group(1), match.group(2)
+        return f"```{lang}\n{re.sub(r'^[ \t]+', '', code, flags=re.MULTILINE)}\n```"
     content = re.sub(r'\.\.\s+code-block::\s*(\w*)\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', replace_code_block, content)
 
-    # 5. Raw HTML Directives (Preserve and Un-indent)
+    # 8. Raw HTML Directives
     def handle_raw_html(match):
-        html_content = match.group(1)
-        unindented = re.sub(r'^[ \t]+', '', html_content, flags=re.MULTILINE)
-        return f"\n{unindented}\n"
+        return f"\n{re.sub(r'^[ \t]+', '', match.group(1), flags=re.MULTILINE)}\n"
     content = re.sub(r'\.\.\s+raw::\s*html\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_raw_html, content)
 
-    # 6. Includes with FAIL-SAFE logic
+    # 9. Includes with FAIL-SAFE logic
     def handle_include(match):
         include_path = match.group(1).strip()
-        resolved_original_path = resolve_sphinx_path(current_rel_path, include_path)
-        abs_original_path = os.path.join(repo_dir, resolved_original_path)
+        resolved_original = resolve_sphinx_path(current_rel_path, include_path)
         
-        staging_file_path = os.path.join(target_base_dir, resolved_original_path)
-        
-        # FAIL-SAFE OR FLAT MODE TRIGGER
-        if mode == 'flat' or not os.path.exists(staging_file_path):
+        if mode == 'flat' or not os.path.exists(os.path.join(target_base_dir, resolved_original)):
             try:
-                with open(abs_original_path, 'r', encoding='utf-8') as f:
-                    included_content = f.read()
-                return "\n\n" + convert_rst_to_md(
-                    included_content, mode, resolved_original_path, repo_dir, target_base_dir
-                ) + "\n\n"
+                with open(os.path.join(repo_dir, resolved_original), 'r', encoding='utf-8') as f:
+                    return "\n\n" + convert_rst_to_md(f.read(), mode, resolved_original, repo_dir, target_base_dir) + "\n\n"
             except Exception:
-                return f"> **Error:** Fail-safe could not resolve or read missing include: {include_path}"
+                return f"> **Error:** Fail-safe missed include: {include_path}"
                 
-        # Normal Mode Syntax
-        if mode == 'mintlify':
-            mdx_path = include_path.lstrip('/').replace('.rst', '.mdx')
-            return f'<Snippet file="{mdx_path}" />'
-        elif mode == 'gitbook':
-            md_path = include_path.replace('.rst', '.md')
-            return f'{{% include "{md_path}" %}}'
+        if mode == 'mintlify': return f'<Snippet file="{include_path.lstrip("/").replace(".rst", ".mdx")}" />'
+        elif mode == 'gitbook': return f'{{% include "{include_path.replace(".rst", ".md")}" %}}'
             
     content = re.sub(r'^\s*\.\.\s+include::\s+(.+)$', handle_include, content, flags=re.MULTILINE)
 
-    # 7. Admonitions
+    # 10. Admonitions (Strips Sphinx attributes like :name:)
     def handle_admonition(match):
-        adm_type = match.group(1).title()
-        text = match.group(2)
+        adm_type, text = match.group(1).title(), match.group(2)
+        text = re.sub(r'^[ \t]*:[a-zA-Z_-]+:.*$\n', '', text, flags=re.MULTILINE)
         unindented = re.sub(r'^[ \t]+', '', text, flags=re.MULTILINE).strip()
         
-        if mode == 'mintlify':
-            return f"<{adm_type}>\n{unindented}\n</{adm_type}>"
-        else:
-            return f"> **{adm_type}**\n> {unindented.replace(chr(10), chr(10) + '> ')}"
+        if mode == 'mintlify': return f"<{adm_type}>\n{unindented}\n</{adm_type}>"
+        return f"> **{adm_type}**\n> {unindented.replace(chr(10), chr(10) + '> ')}"
     content = re.sub(r'\.\.\s+(note|warning|tip|important|caution|info)::\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_admonition, content)
 
-    # 8. Mermaid Diagrams
-    def handle_mermaid(match):
-        mmd_path = match.group(1).strip()
-        resolved_path = resolve_sphinx_path(current_rel_path, mmd_path)
-        abs_path = os.path.join(repo_dir, resolved_path)
-        try:
-            with open(abs_path, 'r', encoding='utf-8') as f:
-                mmd_content = f.read().strip()
-            return f"```mermaid\n{mmd_content}\n```"
-        except Exception:
-            return f"> **Error:** Could not resolve Mermaid diagram: {mmd_path}"
-    content = re.sub(r'^\s*\.\.\s+mermaid::\s+([^\s]+\.mmd)', handle_mermaid, content, flags=re.MULTILINE)
+    # 11. Media (Mermaid, Video)
+    content = re.sub(r'^\s*\.\.\s+mermaid::\s+([^\s]+\.mmd)', lambda m: f"```mermaid\n{open(os.path.join(repo_dir, resolve_sphinx_path(current_rel_path, m.group(1).strip())), 'r', encoding='utf-8').read().strip()}\n```" if os.path.exists(os.path.join(repo_dir, resolve_sphinx_path(current_rel_path, m.group(1).strip()))) else "", content, flags=re.MULTILINE)
+    content = re.sub(r'^\s*\.\.\s+video::\s+([^\s]+)', lambda m: f'<video controls width="100%"><source src="{m.group(1).strip().lstrip("/")}" type="video/mp4"></video>', content, flags=re.MULTILINE)
 
-    # 9. Videos
-    def handle_video(match):
-        video_path = match.group(1).strip()
-        clean_path = video_path.lstrip('/')
-        return f'<video controls width="100%"><source src="{clean_path}" type="video/mp4"></video>'
-    content = re.sub(r'^\s*\.\.\s+video::\s+([^\s]+)', handle_video, content, flags=re.MULTILINE)
-
-    # 10. Collapse (sphinx_collapse to HTML details)
-    def handle_collapse(match):
-        summary = match.group(1).strip()
-        body = match.group(2)
-        unindented = re.sub(r'^[ \t]+', '', body, flags=re.MULTILINE).strip()
-        return f"<details>\n<summary>{summary}</summary>\n\n{unindented}\n</details>"
-    content = re.sub(r'\.\.\s+collapse::\s*(.*?)\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_collapse, content)
-
-    # 11. Tabs (sphinx_tabs fallback conversion)
-    # Strip the .. tabs:: container
+    # 12. UI Components (Collapse, Tabs)
+    content = re.sub(r'\.\.\s+collapse::\s*(.*?)\n+((?:(?:[ \t]+)[^\n]*\n?)+)', lambda m: f"<details>\n<summary>{m.group(1).strip()}</summary>\n\n{re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE).strip()}\n</details>", content)
     content = re.sub(r'^\s*\.\.\s+tabs::\s*\n', '', content, flags=re.MULTILINE)
-    # Convert individual tabs to headers or gitbook format based on mode
-    def handle_tab(match):
-        title = match.group(1).strip()
-        body = match.group(2)
-        unindented = re.sub(r'^[ \t]+', '', body, flags=re.MULTILINE).strip()
-        if mode == 'mintlify':
-            # Simplified output, manual closure review required for complex nesting
-            return f"### {title}\n\n{unindented}\n" 
-        elif mode == 'gitbook':
-            return f"{{% tab title=\"{title}\" %}}\n{unindented}\n{{% endtab %}}"
-        else:
-            return f"### {title}\n\n{unindented}\n"
-    content = re.sub(r'\.\.\s+tab::\s*(.*?)\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_tab, content)
+    content = re.sub(r'\.\.\s+tab::\s*(.*?)\n+((?:(?:[ \t]+)[^\n]*\n?)+)', lambda m: f"{{% tab title=\"{m.group(1).strip()}\" %}}\n{re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE).strip()}\n{{% endtab %}}" if mode == 'gitbook' else f"### {m.group(1).strip()}\n\n{re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE).strip()}\n", content)
 
-    # 12. Basic formatting inline (`` -> `)
+    # 13. Basic formatting
     content = re.sub(r'``([^`]+)``', r'`\1`', content)
     
     return content
@@ -266,7 +243,7 @@ def generate_segregated_environment(repo_dir, cloud_required, onprem_required, o
             os.makedirs(os.path.dirname(target_abs), exist_ok=True)
             shutil.copy2(src_abs, target_abs)
 
-    # 1. Standard Segregation Copy
+    # 1. Standard Segregation Copy (For all modes)
     for root, dirs, files in os.walk(repo_dir):
         dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith('.')]
         for file in files:
@@ -284,7 +261,7 @@ def generate_segregated_environment(repo_dir, cloud_required, onprem_required, o
                 safe_copy(rel_path, onprem_dir)
                 stats["onprem"] += 1
 
-    # 2. Translation Execution (If requested)
+    # 2. Translation Execution (Only if Markdown is selected)
     if output_mode != 'rest':
         for target_env in [cloud_dir, onprem_dir]:
             if not os.path.exists(target_env): continue
@@ -355,11 +332,12 @@ def main():
         
         if st.button("🔍 Scan for Tags & Dependencies"):
             with st.spinner("Mapping dependency graph..."):
-                c_req, o_req, untagged, deps = analyze_dependencies(REPO_DIR)
+                c_req, o_req, untagged, deps, grid_tables = analyze_dependencies(REPO_DIR)
                 
                 st.session_state['cloud_req'] = c_req
                 st.session_state['onprem_req'] = o_req
                 st.session_state['deps'] = deps
+                st.session_state['grid_tables'] = grid_tables
                 
                 df = pd.DataFrame({"File Path": sorted(untagged), "Action": ["Ignore"] * len(untagged)})
                 st.session_state['untagged_df'] = df
@@ -389,6 +367,12 @@ def main():
                 options=["Sphinx reST (Original)", "Mintlify (MDX)", "GitBook (MD)", "Flat Markdown (MD)"],
                 help="Select your target migration tool. If flat is selected or references are missing, content will be safely inlined."
             )
+
+            # Warning for Grid Tables if migrating to Markdown
+            if output_format != "Sphinx reST (Original)" and st.session_state.get('grid_tables'):
+                st.warning(f"⚠️ **Warning:** Found {len(st.session_state['grid_tables'])} files containing Sphinx Grid Tables. Standard Markdown does not support grid tables. These will render as raw text and require manual formatting in your target platform.")
+                with st.expander("View files with Grid Tables"):
+                    st.write(list(st.session_state['grid_tables']))
 
             if st.button("🚀 Apply Manual Tags & Generate ZIP", type="primary"):
                 with st.spinner("Applying rules, generating output, and zipping files..."):
