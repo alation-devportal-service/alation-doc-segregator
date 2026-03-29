@@ -8,7 +8,6 @@ import shutil
 import csv
 import io
 import pandas as pd
-import asyncio
 import google.generativeai as genai
 
 # --- 1. SETUP & CONSTANTS ---
@@ -85,7 +84,7 @@ def analyze_dependencies(repo_dir):
                         role_str = role_match.group(1).lower()
                         file_roles[file_path] = 'Admin' if 'admin' in role_str else 'User'
                     else:
-                        file_roles[file_path] = 'User' # Default fallback
+                        file_roles[file_path] = 'User'
                     
                     if RE_GRID_TABLE.search(content): grid_table_files.add(file_path)
                     for match in RE_LABEL_DEF.finditer(content): label_to_file[match.group(1).strip()] = file_path
@@ -177,35 +176,7 @@ def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir
     
     return content
 
-# --- 5. AI GUIDE GENERATOR ---
-async def generate_guide(model, bucket_name, system_context, flat_content):
-    prompt = f"""
-    {system_context}
-    
-    Task: You are an expert Alation Technical Writer. Using ONLY the raw documentation provided below, synthesize a comprehensive, cohesive, logically flowing Markdown guide specifically for '{bucket_name}'. 
-    - Create a logical Table of Contents.
-    - Group similar topics.
-    - Preserve all technical accuracy, code blocks, and configuration steps. Do not hallucinate features.
-    
-    Raw Content:
-    {flat_content[:3000000]} # Safe cutoff to ensure it fits comfortably in prompt limits
-    """
-    try:
-        response = await model.generate_content_async(prompt)
-        return bucket_name, response.text
-    except Exception as e:
-        return bucket_name, f"# Error generating {bucket_name}\n{e}"
-
-async def process_ai_guides(api_key, system_context, buckets):
-    genai.configure(api_key=api_key)
-    # Using Gemini 2.5 Pro for massive context and complex reasoning
-    model = genai.GenerativeModel('gemini-2.5-pro') 
-    
-    tasks = [generate_guide(model, name, system_context, content) for name, content in buckets.items() if content.strip()]
-    results = await asyncio.gather(*tasks)
-    return {name: text for name, text in results}
-
-# --- 6. FILE GENERATION & ZIP ---
+# --- 5. FILE GENERATION & ZIP ---
 def generate_segregated_environment(repo_dir, cloud_required, onprem_required, output_mode):
     staging_dir = os.path.join(tempfile.gettempdir(), f"segregated_docs_{os.urandom(4).hex()}")
     cloud_dir, onprem_dir = os.path.join(staging_dir, "Alation Cloud Service"), os.path.join(staging_dir, "CustomerManaged")
@@ -245,7 +216,7 @@ def generate_segregated_environment(repo_dir, cloud_required, onprem_required, o
     shutil.rmtree(staging_dir, ignore_errors=True)
     return zip_filepath, stats
 
-# --- 7. UI WORKFLOW ---
+# --- 6. UI WORKFLOW ---
 def main():
     with st.sidebar:
         st.header("🔑 Credentials Setup")
@@ -317,49 +288,76 @@ def main():
 
             st.divider()
             st.write("### 5. AI Guide Generation")
-            st.info("Uses Gemini 2.5 Pro to synthesize your flat, categorized documentation into structured Admin and User guides.")
+            st.info("Uses Gemini 2.5 Pro to sequentially synthesize your flat, categorized documentation into structured Admin and User guides. Optimized to prevent Streamlit Cloud timeouts.")
             
             if gemini_key:
                 if st.button("🤖 Synthesize AI Guides (Admin/User)", type="primary"):
-                    with st.spinner("Flattening contextual boundaries and calling Gemini API... this may take a few minutes."):
-                        final_cloud, final_onprem = set(st.session_state['cloud_req']), set(st.session_state['onprem_req'])
-                        roles = st.session_state['roles']
-                        
-                        # Flat build helper
-                        def get_flat_content(files_set):
-                            content_str = ""
-                            for file in files_set:
-                                abs_p = os.path.join(REPO_DIR, file)
-                                if os.path.exists(abs_p) and file.endswith('.rst'):
-                                    with open(abs_p, 'r', encoding='utf-8') as f:
-                                        content_str += f"\n\n--- Source: {file} ---\n" + convert_rst_to_md(f.read(), 'flat', file, REPO_DIR, REPO_DIR)
-                            return content_str
-
-                        system_context = "System Instructions:\n"
-                        for p in [GLOSSARY_PATH, ROLES_PATH]:
-                            if os.path.exists(os.path.join(REPO_DIR, p)):
-                                with open(os.path.join(REPO_DIR, p), 'r', encoding='utf-8') as f:
-                                    system_context += f"\n{convert_rst_to_md(f.read(), 'flat', p, REPO_DIR, REPO_DIR)}"
-                        
-                        buckets = {
-                            "Cloud_Admin_Guide": get_flat_content({f for f in final_cloud if roles.get(f) == 'Admin'}),
-                            "Cloud_User_Guide": get_flat_content({f for f in final_cloud if roles.get(f) == 'User'}),
-                            "OnPrem_Admin_Guide": get_flat_content({f for f in final_onprem if roles.get(f) == 'Admin'}),
-                            "OnPrem_User_Guide": get_flat_content({f for f in final_onprem if roles.get(f) == 'User'})
-                        }
-
-                        results = asyncio.run(process_ai_guides(gemini_key, system_context, buckets))
-                        
-                        # Package AI results into a ZIP
-                        ai_staging = os.path.join(tempfile.gettempdir(), f"ai_guides_{os.urandom(4).hex()}")
-                        os.makedirs(ai_staging, exist_ok=True)
-                        for name, text in results.items():
-                            with open(os.path.join(ai_staging, f"{name}.md"), 'w', encoding='utf-8') as f: f.write(text)
+                    # Process sequentially with Streamlit Status to prevent WebSocket Timeouts
+                    with st.status("Starting AI Generation Engine...", expanded=True) as status:
+                        try:
+                            genai.configure(api_key=gemini_key)
+                            model = genai.GenerativeModel('gemini-2.5-pro')
                             
-                        ai_zip = shutil.make_archive(os.path.join(tempfile.gettempdir(), "AI_Generated_Guides"), 'zip', ai_staging)
-                        st.success("AI Generation Complete!")
-                        with open(ai_zip, "rb") as fp:
-                            st.download_button("📥 Download AI Generated Guides (ZIP)", data=fp, file_name="AI_Generated_Guides.zip", mime="application/zip", type="primary")
+                            final_cloud, final_onprem = set(st.session_state['cloud_req']), set(st.session_state['onprem_req'])
+                            roles = st.session_state['roles']
+                            
+                            def get_flat_content(files_set):
+                                content_str = ""
+                                for file in files_set:
+                                    abs_p = os.path.join(REPO_DIR, file)
+                                    if os.path.exists(abs_p) and file.endswith('.rst'):
+                                        with open(abs_p, 'r', encoding='utf-8') as f:
+                                            content_str += f"\n\n--- Source: {file} ---\n" + convert_rst_to_md(f.read(), 'flat', file, REPO_DIR, REPO_DIR)
+                                return content_str
+
+                            status.update(label="Building Global System Context...")
+                            system_context = "System Instructions:\n"
+                            for p in [GLOSSARY_PATH, ROLES_PATH]:
+                                if os.path.exists(os.path.join(REPO_DIR, p)):
+                                    with open(os.path.join(REPO_DIR, p), 'r', encoding='utf-8') as f:
+                                        system_context += f"\n{convert_rst_to_md(f.read(), 'flat', p, REPO_DIR, REPO_DIR)}"
+                            
+                            bucket_definitions = {
+                                "Cloud_Admin_Guide": {f for f in final_cloud if roles.get(f) == 'Admin'},
+                                "Cloud_User_Guide": {f for f in final_cloud if roles.get(f) == 'User'},
+                                "OnPrem_Admin_Guide": {f for f in final_onprem if roles.get(f) == 'Admin'},
+                                "OnPrem_User_Guide": {f for f in final_onprem if roles.get(f) == 'User'}
+                            }
+
+                            ai_staging = os.path.join(tempfile.gettempdir(), f"ai_guides_{os.urandom(4).hex()}")
+                            os.makedirs(ai_staging, exist_ok=True)
+                            
+                            # Sequential Processing to save RAM and keep Streamlit alive
+                            for bucket_name, files_set in bucket_definitions.items():
+                                if not files_set: continue
+                                
+                                status.update(label=f"Flattening content for {bucket_name}...")
+                                flat_content = get_flat_content(files_set)
+                                
+                                if not flat_content.strip(): continue
+                                
+                                status.update(label=f"Calling Gemini 2.5 Pro for {bucket_name}... (This takes 1-3 minutes)")
+                                prompt = f"{system_context}\n\nTask: You are an expert Alation Technical Writer. Using ONLY the raw documentation provided below, synthesize a comprehensive, cohesive, logically flowing Markdown guide specifically for '{bucket_name}'.\n- Create a logical Table of Contents.\n- Group similar topics.\n- Preserve all technical accuracy, code blocks, and configuration steps. Do not hallucinate features.\n\nRaw Content:\n{flat_content[:3000000]}"
+                                
+                                try:
+                                    response = model.generate_content(prompt)
+                                    with open(os.path.join(ai_staging, f"{bucket_name}.md"), 'w', encoding='utf-8') as f: f.write(response.text)
+                                except Exception as e:
+                                    st.error(f"Error generating {bucket_name}: {e}")
+                                
+                                # Immediately free up memory before the next loop
+                                del flat_content 
+                                
+                            ai_zip = shutil.make_archive(os.path.join(tempfile.gettempdir(), "AI_Generated_Guides"), 'zip', ai_staging)
+                            status.update(label="✅ All AI Guides Generated Successfully!", state="complete", expanded=False)
+                            
+                            with open(ai_zip, "rb") as fp:
+                                st.download_button("📥 Download AI Generated Guides (ZIP)", data=fp, file_name="AI_Generated_Guides.zip", mime="application/zip", type="primary")
+
+                        except Exception as e:
+                            status.update(label="❌ AI Generation Failed", state="error", expanded=True)
+                            st.error(f"Critical Failure: {e}")
+
             else:
                 st.warning("⚠️ Enter your Gemini API Key in the sidebar to unlock AI Guide Generation.")
 
