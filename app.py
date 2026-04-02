@@ -119,7 +119,8 @@ def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir
     content = re.sub(r'\.\.\s+only::\s*latex\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', '', content)
     content = re.sub(r'^\s*\.\.\s+rst-class::.*$', '', content, flags=re.MULTILINE)
 
-    def unwrap_block(m): return "\n" + re.sub(r'^[ \t]+', '', m.group(1), flags=re.MULTILINE) + "\n"
+    def unwrap_block(m): 
+        return "\n" + re.sub(r'^[ \t]+', '', m.group(1), flags=re.MULTILINE) + "\n"
     content = re.sub(r'\.\.\s+(?:only::\s*html|container::)\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', unwrap_block, content)
 
     def handle_meta(m):
@@ -141,8 +142,17 @@ def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir
     content = re.sub(r':doc:`(?:[^<`]*<([^>]+)>|([^`]+))`', lambda m: f"[{m.group(1) or m.group(2)}]({(m.group(1) or m.group(2)).replace('.rst', '')}.md)", content)
     content = re.sub(r':ref:`(?:[^<`]*<([^>]+)>|([^`]+))`', lambda m: f"[{m.group(1) or m.group(2)}](#{(m.group(1) or m.group(2)).lower().replace(' ', '-')})", content)
 
-    content = re.sub(r'\.\.\s+code-block::\s*(\w*)\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', lambda m: f"```{m.group(1)}\n{re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE)}\n```", content)
-    content = re.sub(r'\.\.\s+raw::\s*html\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', lambda m: f"\n{re.sub(r'^[ \t]+', '', m.group(1), flags=re.MULTILINE)}\n", content)
+    # Re-factored Code Block handler for Python 3.11 compatibility
+    def handle_code_block(m):
+        code = re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE)
+        return f"```{m.group(1)}\n{code}\n```"
+    content = re.sub(r'\.\.\s+code-block::\s*(\w*)\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_code_block, content)
+
+    # Re-factored HTML handler for Python 3.11 compatibility
+    def handle_raw_html(m):
+        html = re.sub(r'^[ \t]+', '', m.group(1), flags=re.MULTILINE)
+        return f"\n{html}\n"
+    content = re.sub(r'\.\.\s+raw::\s*html\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_raw_html, content)
 
     def handle_include(m):
         include_path = m.group(1).strip()
@@ -167,11 +177,32 @@ def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir
         return f"> **{adm_type}**\n> {unindented.replace(chr(10), chr(10) + '> ')}"
     content = re.sub(r'\.\.\s+(note|warning|tip|important|caution|info)::\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_admonition, content)
 
-    content = re.sub(r'^\s*\.\.\s+mermaid::\s+([^\s]+\.mmd)', lambda m: f"```mermaid\n{open(os.path.join(repo_dir, resolve_sphinx_path(current_rel_path, m.group(1).strip())), 'r', encoding='utf-8').read().strip()}\n```" if os.path.exists(os.path.join(repo_dir, resolve_sphinx_path(current_rel_path, m.group(1).strip()))) else "", content, flags=re.MULTILINE)
+    def handle_mermaid(m):
+        mmd_path = resolve_sphinx_path(current_rel_path, m.group(1).strip())
+        abs_path = os.path.join(repo_dir, mmd_path)
+        if os.path.exists(abs_path):
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                return f"```mermaid\n{f.read().strip()}\n```"
+        return ""
+    content = re.sub(r'^\s*\.\.\s+mermaid::\s+([^\s]+\.mmd)', handle_mermaid, content, flags=re.MULTILINE)
+    
     content = re.sub(r'^\s*\.\.\s+video::\s+([^\s]+)', lambda m: f'<video controls width="100%"><source src="{m.group(1).strip().lstrip("/")}" type="video/mp4"></video>', content, flags=re.MULTILINE)
-    content = re.sub(r'\.\.\s+collapse::\s*(.*?)\n+((?:(?:[ \t]+)[^\n]*\n?)+)', lambda m: f"<details>\n<summary>{m.group(1).strip()}</summary>\n\n{re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE).strip()}\n</details>", content)
+    
+    # Re-factored UI component handlers for Python 3.11 compatibility
+    def handle_collapse(m):
+        body = re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE).strip()
+        return f"<details>\n<summary>{m.group(1).strip()}</summary>\n\n{body}\n</details>"
+    content = re.sub(r'\.\.\s+collapse::\s*(.*?)\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_collapse, content)
+    
     content = re.sub(r'^\s*\.\.\s+tabs::\s*\n', '', content, flags=re.MULTILINE)
-    content = re.sub(r'\.\.\s+tab::\s*(.*?)\n+((?:(?:[ \t]+)[^\n]*\n?)+)', lambda m: f"{{% tab title=\"{m.group(1).strip()}\" %}}\n{re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE).strip()}\n{{% endtab %}}" if mode == 'gitbook' else f"### {m.group(1).strip()}\n\n{re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE).strip()}\n", content)
+    
+    def handle_tab(m):
+        body = re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE).strip()
+        if mode == 'gitbook':
+            return f"{{% tab title=\"{m.group(1).strip()}\" %}}\n{body}\n{{% endtab %}}"
+        return f"### {m.group(1).strip()}\n\n{body}\n"
+    content = re.sub(r'\.\.\s+tab::\s*(.*?)\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_tab, content)
+
     content = re.sub(r'``([^`]+)``', r'`\1`', content)
     
     return content
@@ -292,7 +323,6 @@ def main():
             
             if gemini_key:
                 if st.button("🤖 Synthesize AI Guides (Admin/User)", type="primary"):
-                    # Process sequentially with Streamlit Status to prevent WebSocket Timeouts
                     with st.status("Starting AI Generation Engine...", expanded=True) as status:
                         try:
                             genai.configure(api_key=gemini_key)
@@ -327,7 +357,6 @@ def main():
                             ai_staging = os.path.join(tempfile.gettempdir(), f"ai_guides_{os.urandom(4).hex()}")
                             os.makedirs(ai_staging, exist_ok=True)
                             
-                            # Sequential Processing to save RAM and keep Streamlit alive
                             for bucket_name, files_set in bucket_definitions.items():
                                 if not files_set: continue
                                 
@@ -345,7 +374,6 @@ def main():
                                 except Exception as e:
                                     st.error(f"Error generating {bucket_name}: {e}")
                                 
-                                # Immediately free up memory before the next loop
                                 del flat_content 
                                 
                             ai_zip = shutil.make_archive(os.path.join(tempfile.gettempdir(), "AI_Generated_Guides"), 'zip', ai_staging)
