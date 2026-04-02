@@ -9,6 +9,7 @@ import csv
 import io
 import pandas as pd
 import google.generativeai as genai
+import gc  # Added for aggressive memory management
 
 # --- 1. SETUP & CONSTANTS ---
 st.set_page_config(page_title="Alation Docs Segregator & AI Exporter", layout="wide")
@@ -119,8 +120,7 @@ def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir
     content = re.sub(r'\.\.\s+only::\s*latex\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', '', content)
     content = re.sub(r'^\s*\.\.\s+rst-class::.*$', '', content, flags=re.MULTILINE)
 
-    def unwrap_block(m): 
-        return "\n" + re.sub(r'^[ \t]+', '', m.group(1), flags=re.MULTILINE) + "\n"
+    def unwrap_block(m): return "\n" + re.sub(r'^[ \t]+', '', m.group(1), flags=re.MULTILINE) + "\n"
     content = re.sub(r'\.\.\s+(?:only::\s*html|container::)\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', unwrap_block, content)
 
     def handle_meta(m):
@@ -142,13 +142,11 @@ def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir
     content = re.sub(r':doc:`(?:[^<`]*<([^>]+)>|([^`]+))`', lambda m: f"[{m.group(1) or m.group(2)}]({(m.group(1) or m.group(2)).replace('.rst', '')}.md)", content)
     content = re.sub(r':ref:`(?:[^<`]*<([^>]+)>|([^`]+))`', lambda m: f"[{m.group(1) or m.group(2)}](#{(m.group(1) or m.group(2)).lower().replace(' ', '-')})", content)
 
-    # Re-factored Code Block handler for Python 3.11 compatibility
     def handle_code_block(m):
         code = re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE)
         return f"```{m.group(1)}\n{code}\n```"
     content = re.sub(r'\.\.\s+code-block::\s*(\w*)\s*\n+((?:(?:[ \t]+)[^\n]*\n?)+)', handle_code_block, content)
 
-    # Re-factored HTML handler for Python 3.11 compatibility
     def handle_raw_html(m):
         html = re.sub(r'^[ \t]+', '', m.group(1), flags=re.MULTILINE)
         return f"\n{html}\n"
@@ -188,7 +186,6 @@ def convert_rst_to_md(content, mode, current_rel_path, repo_dir, target_base_dir
     
     content = re.sub(r'^\s*\.\.\s+video::\s+([^\s]+)', lambda m: f'<video controls width="100%"><source src="{m.group(1).strip().lstrip("/")}" type="video/mp4"></video>', content, flags=re.MULTILINE)
     
-    # Re-factored UI component handlers for Python 3.11 compatibility
     def handle_collapse(m):
         body = re.sub(r'^[ \t]+', '', m.group(2), flags=re.MULTILINE).strip()
         return f"<details>\n<summary>{m.group(1).strip()}</summary>\n\n{body}\n</details>"
@@ -241,6 +238,9 @@ def generate_segregated_environment(repo_dir, cloud_required, onprem_required, o
                         translated_content = convert_rst_to_md(raw_content, output_mode, rel_repo_path, repo_dir, target_env)
                         with open(file_path[:-4] + ('.mdx' if output_mode == 'mintlify' else '.md'), 'w', encoding='utf-8') as f: f.write(translated_content)
                         os.remove(file_path)
+                
+                # Flush memory periodically during massive directory walks
+                gc.collect()
 
     zip_base_path = os.path.join(tempfile.gettempdir(), "Alation_Final_Docs")
     zip_filepath = shutil.make_archive(zip_base_path, 'zip', staging_dir)
@@ -285,15 +285,17 @@ def main():
                 c_req, o_req, untagged, deps, grid_tables, roles = analyze_dependencies(REPO_DIR)
                 st.session_state.update({'cloud_req': c_req, 'onprem_req': o_req, 'deps': deps, 'grid_tables': grid_tables, 'roles': roles})
                 st.session_state['untagged_df'] = pd.DataFrame({"File Path": sorted(untagged), "Action": ["Ignore"] * len(untagged)})
+                gc.collect() # Free analysis memory
                 st.success(f"Found {len(c_req)} Cloud files, {len(o_req)} On-Prem files, and {len(untagged)} Untagged files.")
 
         if 'untagged_df' in st.session_state:
             st.divider()
             st.write("### 3. Review Untagged / Orphaned Files")
+            # Replaced deprecated use_container_width with width="stretch"
             edited_df = st.data_editor(
                 st.session_state['untagged_df'],
                 column_config={"Action": st.column_config.SelectboxColumn("Action", options=["Ignore", "Alation Cloud Service", "CustomerManaged", "Both"], required=True), "File Path": st.column_config.TextColumn(disabled=True)},
-                use_container_width=True, hide_index=True
+                width="stretch", hide_index=True
             )
             st.download_button("📄 Download Untagged Report (CSV)", data=st.session_state['untagged_df'].to_csv(index=False).encode('utf-8'), file_name="untagged_report.csv", mime="text/csv")
 
@@ -315,7 +317,7 @@ def main():
                     
                     st.success("Successfully generated environment ZIP!")
                     with open(zip_path, "rb") as fp:
-                        st.download_button("📦 Download Final Output (ZIP)", data=fp, file_name="Alation_Docs_Output.zip", mime="application/zip", type="primary")
+                        st.download_button("📦 Download Final Output (ZIP)", data=fp, file_name="Alation_Docs_Output.zip", mime="application/zip", type="primary", width="stretch")
 
             st.divider()
             st.write("### 5. AI Guide Generation")
@@ -374,13 +376,15 @@ def main():
                                 except Exception as e:
                                     st.error(f"Error generating {bucket_name}: {e}")
                                 
+                                # Instantly kill the massive string from RAM after generating to avoid OOM
                                 del flat_content 
+                                gc.collect()
                                 
                             ai_zip = shutil.make_archive(os.path.join(tempfile.gettempdir(), "AI_Generated_Guides"), 'zip', ai_staging)
                             status.update(label="✅ All AI Guides Generated Successfully!", state="complete", expanded=False)
                             
                             with open(ai_zip, "rb") as fp:
-                                st.download_button("📥 Download AI Generated Guides (ZIP)", data=fp, file_name="AI_Generated_Guides.zip", mime="application/zip", type="primary")
+                                st.download_button("📥 Download AI Generated Guides (ZIP)", data=fp, file_name="AI_Generated_Guides.zip", mime="application/zip", type="primary", width="stretch")
 
                         except Exception as e:
                             status.update(label="❌ AI Generation Failed", state="error", expanded=True)
